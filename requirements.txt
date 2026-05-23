@@ -1,0 +1,27 @@
+# EduBot API v4 - Requirements
+# Janvier NZAMBIMANA | M1 ITN
+# Installation : pip install -r requirements.txt
+
+# Serveur web
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# Validation des donnees
+pydantic==2.10.3
+
+# Orchestration des agents IA
+langgraph==0.2.60
+langchain-core==0.3.28
+
+# Modeles IA - Groq (Llama 3.3 70B, Mixtral 8x7B)
+groq==0.13.1
+
+# Modeles IA - Google Gemini (Flash, Pro, 2.0)
+google-generativeai==0.8.3
+
+# Variables d'environnement
+python-dotenv==1.0.1
+
+# Utilitaires HTTP
+httpx==0.28.1
+anyio==4.7.0
