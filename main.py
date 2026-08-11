@@ -1,4 +1,4 @@
-import os, json, asyncio, time
+import os, json, asyncio, time, threading
 from typing import TypedDict, List, Optional, AsyncIterator
 
 from fastapi import FastAPI
@@ -178,6 +178,108 @@ def call_any_model(
     return fallback_msg, "service_indisponible"
 
 
+# ════════════════════════════════════════════════════════════
+# STREAMING RÉEL — les tokens sont envoyés au client au fur et à
+# mesure qu'ils arrivent du modèle (Groq stream=True / Gemini
+# stream=True). Aucun texte n'est généré à l'avance puis rejoué
+# avec un délai artificiel : ce qui part sur le fil est ce que le
+# modèle est réellement en train d'écrire.
+# ════════════════════════════════════════════════════════════
+async def real_stream(messages: list, max_tokens: int = 2048,
+                       temperature: float = 0.6, prefer_gemini: bool = False):
+    loop  = asyncio.get_event_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    model_used = {"name": None}
+
+    def _try_groq_stream():
+        for model in GROQ_MODELS:
+            try:
+                print(f"  [stream] Essai Groq: {model}")
+                stream = groq_client.chat.completions.create(
+                    model=model, messages=messages,
+                    max_tokens=max_tokens, temperature=temperature, stream=True,
+                )
+                collected = ""
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        collected += delta
+                        loop.call_soon_threadsafe(queue.put_nowait, ("chunk", delta))
+                if len(collected.strip()) > 10:
+                    print(f"  [stream] ✓ Succès: {model}")
+                    return f"Groq/{model}"
+            except Exception as e:
+                print(f"  [stream] ✗ Groq/{model}: {str(e)[:80]}")
+                continue
+        return None
+
+    def _try_gemini_stream():
+        prompt_parts = []
+        for m in messages:
+            role, content = m.get("role", "user"), m.get("content", "")
+            if role == "system":
+                prompt_parts.append(f"[Instructions]: {content}")
+            elif role == "user":
+                prompt_parts.append(f"Question: {content}")
+            elif role == "assistant":
+                prompt_parts.append(f"Réponse précédente: {content}")
+        full_prompt = "\n\n".join(prompt_parts)
+
+        for model_name in GEMINI_MODELS:
+            try:
+                print(f"  [stream] Essai Gemini: {model_name}")
+                model = get_gemini_model(model_name)
+                if model is None:
+                    continue
+                resp_stream = model.generate_content(
+                    full_prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        max_output_tokens=max_tokens, temperature=temperature,
+                    ),
+                    stream=True,
+                )
+                collected = ""
+                for chunk in resp_stream:
+                    if chunk.text:
+                        collected += chunk.text
+                        loop.call_soon_threadsafe(queue.put_nowait, ("chunk", chunk.text))
+                if len(collected.strip()) > 10:
+                    print(f"  [stream] ✓ Succès: {model_name}")
+                    return f"Google/{model_name}"
+            except Exception as e:
+                print(f"  [stream] ✗ Gemini/{model_name}: {str(e)[:80]}")
+                continue
+        return None
+
+    def producer():
+        try:
+            sequences = [_try_gemini_stream, _try_groq_stream] if prefer_gemini \
+                        else [_try_groq_stream, _try_gemini_stream]
+            for fn in sequences:
+                name = fn()
+                if name:
+                    model_used["name"] = name
+                    return
+            # Tous les modèles ont échoué en streaming
+            friendly = user_friendly_error("tous les modeles ont echoue")
+            fallback = f"{friendly}\n\nSi le problème persiste, contactez le support : janviernzambimana91@gmail.com"
+            loop.call_soon_threadsafe(queue.put_nowait, ("chunk", fallback))
+            model_used["name"] = "service_indisponible"
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+    threading.Thread(target=producer, daemon=True).start()
+
+    yield f"data: {json.dumps({'type': 'meta', 'status': 'start'})}\n\n"
+    while True:
+        kind, payload = await queue.get()
+        if kind == "chunk":
+            yield f"data: {json.dumps({'type': 'chunk', 'text': payload})}\n\n"
+        else:
+            yield f"data: {json.dumps({'type': 'done', 'model_used': model_used['name']})}\n\n"
+            break
+
+
 def build_messages(system: str, history: list, question: str) -> list:
     msgs = [{"role": "system", "content": system}]
     for h in history[-8:]:
@@ -253,53 +355,73 @@ class AgentState(TypedDict):
 # ════════════════════════════════════════════════════════════
 # NŒUD 1 : SUPERVISEUR
 # ════════════════════════════════════════════════════════════
-def supervisor_node(state: AgentState) -> AgentState:
-    q    = state["question"].lower()
-    lang = detect_language(state["question"])
+APP_TRIGGERS = [
+    "cree une app","creer une application","code une app",
+    "developpe une app","fais-moi une app","make an app",
+    "create an app","build an app","cree un programme",
+    "cree un site","cree un systeme","code complet",
+    "application complete","projet complet",
+    "cree un jeu","fais un jeu","fais une application",
+    "construis une app","write a program","write an app",
+    "create a website","build a website","faire une app",
+]
+FLUTTER_KW = ["flutter","dart","mobile","application mobile"]
+WEB_KW     = ["html","css","javascript","react","vue","angular","site web","frontend","webpage"]
+SQL_KW     = ["sql","base de donnees","mysql","postgresql","sqlite","mongodb","database"]
+TECH_KW    = ["code","programme","algorithme","fonction","boucle","classe","api",
+              "bug","erreur","reseau","linux","git","docker","machine learning",
+              "intelligence artificielle","ia","ml","data","cybersecurite"]
+SCIENCE_KW = ["mathematiques","physique","chimie","equation","integrale","derivee",
+              "vecteur","biologie","atome","formule","statistiques","probabilites",
+              "thermodynamique","mecanique","optique","electricite"]
+HUMAN_KW   = ["histoire","philosophie","economie","politique","litterature",
+              "psychologie","sociologie","droit","colonialisme","revolution",
+              "geographie","culture","religion","ethique","anthropologie"]
+HEALTH_KW  = ["sante","maladie","medecine","symptome","traitement","nutrition",
+              "sport","bien-etre","mental","depression","anxiete","medicament"]
 
-    app_triggers = [
-        "cree une app","creer une application","code une app",
-        "developpe une app","fais-moi une app","make an app",
-        "create an app","build an app","cree un programme",
-        "cree un site","cree un systeme","code complet",
-        "application complete","projet complet",
-        "cree un jeu","fais un jeu","fais une application",
-        "construis une app","write a program","write an app",
-        "create a website","build a website","faire une app",
-    ]
-    is_app = any(t in q for t in app_triggers)
-
-    flutter_kw = ["flutter","dart","mobile","application mobile"]
-    web_kw     = ["html","css","javascript","react","vue","angular","site web","frontend","webpage"]
-    sql_kw     = ["sql","base de donnees","mysql","postgresql","sqlite","mongodb","database"]
-    tech_kw    = ["code","programme","algorithme","fonction","boucle","classe","api",
-                  "bug","erreur","reseau","linux","git","docker","machine learning",
-                  "intelligence artificielle","ia","ml","data","cybersecurite"]
-    science_kw = ["mathematiques","physique","chimie","equation","integrale","derivee",
-                  "vecteur","biologie","atome","formule","statistiques","probabilites",
-                  "thermodynamique","mecanique","optique","electricite"]
-    human_kw   = ["histoire","philosophie","economie","politique","litterature",
-                  "psychologie","sociologie","droit","colonialisme","revolution",
-                  "geographie","culture","religion","ethique","anthropologie"]
-    health_kw  = ["sante","maladie","medecine","symptome","traitement","nutrition",
-                  "sport","bien-etre","mental","depression","anxiete","medicament"]
+def classify_question(question: str) -> dict:
+    """
+    Classification partagée par le graphe LangGraph (endpoint /chat) et le
+    endpoint de streaming réel /chat/stream, pour éviter toute divergence
+    entre les deux chemins.
+    """
+    q    = question.lower()
+    lang = detect_language(question)
+    is_app = any(t in q for t in APP_TRIGGERS)
 
     if is_app:
         app_type = "python"
-        if any(k in q for k in flutter_kw): app_type = "flutter"
-        elif any(k in q for k in web_kw):   app_type = "web"
-        elif any(k in q for k in sql_kw):   app_type = "sql"
-        return {**state, "topic": "coder", "app_type": app_type, "language": lang}
+        if any(k in q for k in FLUTTER_KW): app_type = "flutter"
+        elif any(k in q for k in WEB_KW):   app_type = "web"
+        elif any(k in q for k in SQL_KW):   app_type = "sql"
+        return {"topic": "coder", "app_type": app_type, "language": lang}
 
     scores = {
-        "tech":    sum(1 for k in tech_kw    if k in q),
-        "science": sum(1 for k in science_kw if k in q),
-        "human":   sum(1 for k in human_kw   if k in q),
-        "health":  sum(1 for k in health_kw  if k in q),
+        "tech":    sum(1 for k in TECH_KW    if k in q),
+        "science": sum(1 for k in SCIENCE_KW if k in q),
+        "human":   sum(1 for k in HUMAN_KW   if k in q),
+        "health":  sum(1 for k in HEALTH_KW  if k in q),
     }
     best  = max(scores, key=scores.get)
     topic = best if scores[best] > 0 else "general"
-    return {**state, "topic": topic, "app_type": "", "language": lang}
+    return {"topic": topic, "app_type": "", "language": lang}
+
+TOPIC_INSTRUCTIONS = {
+    "tech": ("Tu es expert en informatique, programmation et technologies numériques. "
+             "Réponds de façon structurée avec exemples concrets. Sans emojis.", False),
+    "science": ("Tu es expert en sciences exactes : maths, physique, chimie, biologie. "
+                "Explique avec rigueur, montre les formules et calculs étape par étape. Sans emojis.", True),
+    "human": ("Tu es expert en sciences humaines : histoire, philosophie, économie, droit, géographie. "
+              "Fournis des analyses nuancées avec contexte historique. Sans emojis.", True),
+    "health": ("Tu es assistant santé éducatif. Donne des infos générales sur santé et bien-être. "
+               "RAPPELLE TOUJOURS de consulter un professionnel de santé pour tout problème médical. Sans emojis.", False),
+    "general": ("Réponds de manière claire, complète et pédagogique. Sans emojis.", False),
+}
+
+def supervisor_node(state: AgentState) -> AgentState:
+    classification = classify_question(state["question"])
+    return {**state, **classification}
 
 # ════════════════════════════════════════════════════════════
 # NŒUD 2 : AGENT CODEUR
@@ -477,36 +599,259 @@ edubot_graph = build_graph()
 print("Graphe LangGraph construit avec succès")
 
 # ════════════════════════════════════════════════════════════
-# STREAMING SSE — mot par mot avec délai naturel
-# ════════════════════════════════════════════════════════════
-async def stream_response(text: str, meta: dict) -> AsyncIterator[str]:
-    yield f"data: {json.dumps({'type': 'meta', **meta})}\n\n"
-    await asyncio.sleep(0)
-
-    words = text.split(" ")
-    for i, word in enumerate(words):
-        chunk = word + (" " if i < len(words) - 1 else "")
-        yield f"data: {json.dumps({'type': 'chunk', 'text': chunk})}\n\n"
-        # Délai naturel : ponctuation = petite pause, sinon rythme régulier
-        if word.endswith((".", "!", "?", ":", ";")):
-            await asyncio.sleep(0.055)
-        elif word.endswith(","):
-            await asyncio.sleep(0.030)
-        else:
-            await asyncio.sleep(0.022)
-
-    yield f"data: {json.dumps({'type': 'done'})}\n\n"
-
-# ════════════════════════════════════════════════════════════
 # API FASTAPI
 # ════════════════════════════════════════════════════════════
 app = FastAPI(
     title="EduBot",
     description="Assistant pédagogique — Janvier NZAMBIMANA, M1 ITN",
-    version="3.0.0",
+    version="3.1.0",
 )
 app.add_middleware(CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ════════════════════════════════════════════════════════════
+# MODULE EMI — Éducation aux Médias et à l'Information
+# (UNESCO Youth Hackathon 2026)
+# Contenu réel (tips, sources, quiz) servi par le backend :
+# une seule source de vérité, partagée par le front web et
+# l'app Flutter — rien n'est codé en dur côté client.
+# ════════════════════════════════════════════════════════════
+EMI_FACTCHECK_SYSTEM = (
+    "Tu es un expert en fact-checking et en éducation aux médias et à l'information (EMI), "
+    "formé aux méthodes utilisées par les grands réseaux de vérification indépendants dans le monde "
+    "(Africa Check, AFP Factuel, Reuters Fact Check, Full Check, PesaCheck, Dubawa, BBC Afrique, etc.). "
+    "Tu analyses une information de façon rigoureuse, nuancée, sans excès de confiance quand "
+    "la preuve manque. Tu réponds UNIQUEMENT avec un objet JSON valide, sans texte autour, "
+    "sans balises markdown, exactement au format suivant :\n"
+    '{"verdict":"VRAI|FAUX|PARTIELLEMENT VRAI|NON VÉRIFIABLE",'
+    '"titre":"résumé du verdict en une phrase courte",'
+    '"explication":"2 à 3 phrases expliquant le raisonnement",'
+    '"conseils":"1 à 2 conseils pratiques pour vérifier ce type d\'information soi-même",'
+    '"sources":"2 à 4 organismes CONCRETS et vérifiables, cités par leur nom réel"}\n\n'
+    "Règle importante pour le champ \"sources\" : ne réponds JAMAIS par une catégorie vague "
+    "comme \"un site de fact-checking\" ou \"les autorités sanitaires\". Cite des noms précis, "
+    "choisis en fonction du SUJET et, si un pays ou une région est identifiable dans le texte à "
+    "vérifier, en priorité des organismes pertinents pour cette zone :\n"
+    "- Santé/médical → OMS, CDC, ou l'autorité sanitaire du pays concerné si tu peux l'identifier\n"
+    "- Info générale Afrique australe/est → Africa Check, PesaCheck (Afrique de l'Est)\n"
+    "- Info générale Afrique de l'Ouest → Dubawa (Nigeria/Ghana), Africa Check, Seneweb Vérif (Sénégal)\n"
+    "- Info générale Afrique centrale → Congo Check (RDC), Africa Check\n"
+    "- Info internationale/politique → AFP Factuel, Reuters Fact Check, Full Fact\n"
+    "- Éducation aux médias en général → UNESCO\n"
+    "Si le pays n'est pas identifiable, propose un mélange d'organismes globaux et régionaux "
+    "pertinents pour le sujet plutôt qu'une liste générique identique à chaque réponse."
+)
+
+def build_factcheck_messages(text: str) -> list:
+    return [
+        {"role": "system", "content": EMI_FACTCHECK_SYSTEM},
+        {"role": "user", "content": f'Information à analyser : "{text}"'},
+    ]
+
+EMI_TIPS = [
+    {"icon": "ti-clock-pause", "color": "#F79009", "bg": "#FFFAEB",
+     "title": "Respire avant de partager",
+     "text": "Une info qui pousse à réagir tout de suite (peur, colère) est souvent conçue pour être partagée sans vérification."},
+    {"icon": "ti-user-search", "color": "#2251CC", "bg": "#EEF3FF",
+     "title": "Identifie la source réelle",
+     "text": "Un message WhatsApp ou Facebook forwardé n'a pas de source vérifiable : remonte jusqu'au média ou à l'institution d'origine."},
+    {"icon": "ti-calendar-off", "color": "#7C3AED", "bg": "#F5F3FF",
+     "title": "Vérifie la date",
+     "text": "Une vraie information republiée hors contexte, des années après, devient une fausse information dans le présent."},
+    {"icon": "ti-photo-search", "color": "#17B26A", "bg": "#ECFDF3",
+     "title": "Recherche l'image inversée",
+     "text": "Une capture d'écran ou une photo peut venir d'un autre pays ou d'un autre événement : utilise la recherche d'image inversée."},
+    {"icon": "ti-building-bank", "color": "#F04438", "bg": "#FFF0F0",
+     "title": "Méfie-toi des fausses annonces officielles",
+     "text": "Un gouvernement ou une banque n'annonce jamais une décision uniquement via une image WhatsApp non signée."},
+    {"icon": "ti-wifi-off", "color": "#2251CC", "bg": "#EEF3FF",
+     "title": "Le coût des données joue contre toi",
+     "text": "En zone à connexion coûteuse, on partage vite sans ouvrir le lien : ouvre l'article avant de transférer, même si ça coûte des Mo."},
+    {"icon": "ti-radio", "color": "#F79009", "bg": "#FFFAEB",
+     "title": "Croise radio, presse écrite et web",
+     "text": "Une info réellement importante circule sur plusieurs médias indépendants, pas uniquement dans un seul groupe WhatsApp."},
+    {"icon": "ti-language", "color": "#7C3AED", "bg": "#F5F3FF",
+     "title": "Attention aux traductions approximatives",
+     "text": "Une citation traduite depuis une langue étrangère peut perdre son sens d'origine : cherche la déclaration originale."},
+    {"icon": "ti-coin", "color": "#17B26A", "bg": "#ECFDF3",
+     "title": "Doute des promesses trop belles",
+     "text": "Argent gratuit, forfait internet illimité offert, cadeau d'une entreprise : ce sont des schémas classiques d'arnaque ou de désinformation."},
+    {"icon": "ti-messages", "color": "#F04438", "bg": "#FFF0F0",
+     "title": "Signale sans humilier",
+     "text": "Si un proche partage une fausse info, corrige-le avec une source fiable en message privé plutôt que publiquement."},
+]
+
+EMI_SOURCES = [
+    {"name": "Africa Check", "url": "https://africacheck.org",
+     "desc": "Premier site de fact-checking indépendant en Afrique, vérifie les affirmations publiques et virales.",
+     "icon": "ti-shield-check", "color": "#17B26A",
+     "regions": ["global", "afrique_australe", "afrique_ouest", "afrique_est"], "topics": ["general", "politique", "sante"]},
+    {"name": "AFP Factuel", "url": "https://factuel.afp.com",
+     "desc": "Cellule de vérification de l'Agence France-Presse, spécialisée dans les fausses images et vidéos virales.",
+     "icon": "ti-news", "color": "#2251CC",
+     "regions": ["global"], "topics": ["general", "politique", "viral"]},
+    {"name": "OMS", "url": "https://www.who.int",
+     "desc": "Organisation Mondiale de la Santé — source de référence pour toute information médicale ou sanitaire.",
+     "icon": "ti-heartbeat", "color": "#F04438",
+     "regions": ["global"], "topics": ["sante"]},
+    {"name": "UNESCO", "url": "https://www.unesco.org",
+     "desc": "Ressources et programmes d'éducation aux médias et à l'information (EMI) à l'échelle mondiale.",
+     "icon": "ti-school", "color": "#7C3AED",
+     "regions": ["global"], "topics": ["education", "general"]},
+    {"name": "BBC Afrique", "url": "https://www.bbc.com/afrique",
+     "desc": "Rédaction BBC dédiée à l'actualité africaine, avec un service régulier de vérification des faits.",
+     "icon": "ti-broadcast", "color": "#F79009",
+     "regions": ["global", "afrique_ouest", "afrique_est", "afrique_australe"], "topics": ["general", "politique"]},
+    {"name": "RFI", "url": "https://www.rfi.fr",
+     "desc": "Radio France Internationale — couverture et analyse continue de l'actualité africaine et internationale.",
+     "icon": "ti-radio", "color": "#2251CC",
+     "regions": ["global", "afrique_ouest", "afrique_centrale"], "topics": ["general", "politique"]},
+    {"name": "PesaCheck", "url": "https://pesacheck.org",
+     "desc": "Réseau de fact-checking dédié à l'Afrique de l'Est (Kenya, Tanzanie, Ouganda, Rwanda...).",
+     "icon": "ti-shield-check", "color": "#17B26A",
+     "regions": ["afrique_est"], "topics": ["general", "politique", "sante"]},
+    {"name": "Dubawa", "url": "https://dubawa.org",
+     "desc": "Organisation de fact-checking couvrant le Nigeria, le Ghana, la Sierra Leone et le Liberia.",
+     "icon": "ti-shield-check", "color": "#17B26A",
+     "regions": ["afrique_ouest"], "topics": ["general", "politique"]},
+    {"name": "Congo Check", "url": "https://congocheck.net",
+     "desc": "Vérification des faits centrée sur la République Démocratique du Congo et l'Afrique centrale.",
+     "icon": "ti-shield-check", "color": "#17B26A",
+     "regions": ["afrique_centrale"], "topics": ["general", "politique"]},
+    {"name": "Real411", "url": "https://www.real411.org",
+     "desc": "Plateforme sud-africaine de signalement et de vérification de la désinformation.",
+     "icon": "ti-shield-check", "color": "#17B26A",
+     "regions": ["afrique_australe"], "topics": ["general", "politique"]},
+    {"name": "Reuters Fact Check", "url": "https://www.reuters.com/fact-check",
+     "desc": "Cellule de vérification de l'agence Reuters, couverture internationale des rumeurs virales.",
+     "icon": "ti-news", "color": "#2251CC",
+     "regions": ["global"], "topics": ["general", "politique", "viral"]},
+    {"name": "CDC", "url": "https://www.cdc.gov",
+     "desc": "Centres américains de contrôle des maladies — référence pour les questions de santé publique.",
+     "icon": "ti-heartbeat", "color": "#F04438",
+     "regions": ["global"], "topics": ["sante"]},
+]
+
+# Suggestions d'organismes envoyées par les utilisateurs (ex: fact-checkeur
+# local non encore référencé). Stockage en mémoire pour la démonstration :
+# à remplacer par une vraie base de données (Postgres/SQLite) en production,
+# sinon la liste est perdue à chaque redémarrage du serveur.
+EMI_SUGGESTED_SOURCES: list = []
+
+EMI_QUIZ = [
+    {"q": "Un message WhatsApp affirme qu'un remède maison guérit une maladie grave. Que fais-tu en premier ?",
+     "opts": ["Je le partage à ma famille par précaution", "Je vérifie sur le site de l'OMS ou avec un professionnel de santé",
+              "Je le crois car il vient d'un proche", "Je l'ignore sans vérifier ni informer personne"],
+     "ans": 1, "exp": "Une information de santé virale doit toujours être confrontée à une source médicale fiable comme l'OMS avant d'être crue ou partagée."},
+    {"q": "Une image choc circule sur les réseaux sociaux pour illustrer un conflit récent. Quel est le meilleur réflexe ?",
+     "opts": ["La partager immédiatement vu son caractère urgent", "Faire une recherche d'image inversée pour vérifier son origine",
+              "Vérifier uniquement le nombre de partages", "Supposer qu'elle est vraie si elle a beaucoup de likes"],
+     "ans": 1, "exp": "La recherche d'image inversée permet souvent de découvrir qu'une photo choc vient d'un autre lieu ou d'une autre époque."},
+    {"q": "Qu'est-ce que la désinformation, par opposition à la mésinformation ?",
+     "opts": ["Les deux termes sont identiques", "La désinformation est diffusée intentionnellement pour tromper",
+              "La désinformation est toujours produite par un gouvernement", "La mésinformation est toujours volontaire"],
+     "ans": 1, "exp": "La désinformation implique une intention de tromper, contrairement à la mésinformation qui est un partage d'erreur de bonne foi."},
+    {"q": "Un compte anonyme prétend être un média officiel et annonce une mesure gouvernementale surprenante. Que dois-tu vérifier ?",
+     "opts": ["Le nombre d'abonnés du compte", "L'existence d'une annonce correspondante sur le site officiel ou un média reconnu",
+              "Si le message est bien orthographié", "Rien, un compte avec un joli logo est fiable"],
+     "ans": 1, "exp": "Un nom ou un logo officiel peut être imité facilement : seule une source officielle vérifiable confirme une annonce publique."},
+    {"q": "Pourquoi la date de publication d'un article est-elle importante en EMI ?",
+     "opts": ["Elle ne l'est pas si le contenu semble vrai", "Un vieux fait relayé comme actuel peut créer une fausse impression du présent",
+              "Seul le titre compte", "La date sert uniquement pour le classement du site"],
+     "ans": 1, "exp": "Une information vraie mais ancienne, repartagée hors contexte, devient trompeuse car elle laisse croire à un événement récent."},
+    {"q": "Quel est le rôle principal d'un site comme Africa Check ou AFP Factuel ?",
+     "opts": ["Créer du contenu viral", "Vérifier des affirmations publiques et publier le résultat avec les preuves",
+              "Remplacer les médias traditionnels", "Censurer les réseaux sociaux"],
+     "ans": 1, "exp": "Ces organisations vérifient méthodiquement des affirmations virales ou publiques et publient leurs sources et leur méthode."},
+    {"q": "Tu reçois un message annonçant un cadeau gratuit d'une grande entreprise si tu cliques sur un lien et le partages à 10 contacts. C'est probablement :",
+     "opts": ["Une vraie promotion à saisir vite", "Une arnaque ou une chaîne de désinformation classique",
+              "Un test officiel de l'entreprise", "Un cadeau garanti par WhatsApp"],
+     "ans": 1, "exp": "La demande de partage massif avant toute vérification est une caractéristique classique des arnaques et chaînes virales."},
+]
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINTS EMI — module UNESCO Youth Hackathon 2026
+# ════════════════════════════════════════════════════════════
+class FactCheckRequest(BaseModel):
+    text: str
+
+class SourceSuggestion(BaseModel):
+    name:        str
+    url:         str
+    description: str = ""
+    region:      str = ""   # ex: "afrique_ouest", "afrique_est"...
+    topic:       str = ""   # ex: "sante", "politique"...
+    submitted_by: str = ""
+
+@app.post("/emi/factcheck/stream")
+async def emi_factcheck_stream(req: "FactCheckRequest"):
+    text = (req.text or "").strip()
+    if not text:
+        async def _empty():
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Texte vide'})}\n\n"
+        return StreamingResponse(_empty(), media_type="text/event-stream")
+
+    messages = build_factcheck_messages(text)
+    return StreamingResponse(
+        real_stream(messages, max_tokens=700, temperature=0.3, prefer_gemini=False),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+@app.get("/emi/tips")
+def emi_tips():
+    return {"tips": EMI_TIPS}
+
+@app.get("/emi/sources")
+def emi_sources(region: Optional[str] = None, topic: Optional[str] = None):
+    """
+    Sans paramètre : renvoie toute la base (comportement précédent, gardé
+    pour compatibilité). Avec ?region=afrique_ouest et/ou ?topic=sante :
+    remonte en priorité les organismes pertinents pour cette zone/ce sujet,
+    puis les organismes globaux, plutôt qu'une liste identique pour tout
+    le monde. Les suggestions communautaires approuvées sont incluses.
+    """
+    all_sources = EMI_SOURCES + [s for s in EMI_SUGGESTED_SOURCES if s.get("approved")]
+
+    if not region and not topic:
+        return {"sources": all_sources}
+
+    def score(s):
+        pts = 0
+        if region and region in s.get("regions", []): pts += 2
+        if topic and topic in s.get("topics", []):   pts += 2
+        if "global" in s.get("regions", []):          pts += 1
+        return pts
+
+    ranked = sorted(all_sources, key=score, reverse=True)
+    return {"sources": ranked}
+
+@app.post("/emi/sources/suggest")
+def emi_suggest_source(sug: SourceSuggestion):
+    """
+    Permet à un utilisateur de signaler un organisme de vérification qu'il
+    connaît et qui manque à la base (ex: un fact-checkeur local). Stocké en
+    mémoire pour cette version — à brancher sur une vraie base de données
+    avant une mise en production durable, sinon les suggestions sont
+    perdues au redémarrage du serveur.
+    """
+    if not sug.name.strip() or not sug.url.strip():
+        return {"status": "error", "message": "Le nom et l'URL sont obligatoires."}
+    entry = {
+        "name": sug.name.strip(), "url": sug.url.strip(), "desc": sug.description.strip(),
+        "icon": "ti-user-plus", "color": "#7B8BB2",
+        "regions": [sug.region] if sug.region else [], "topics": [sug.topic] if sug.topic else [],
+        "submitted_by": sug.submitted_by.strip(), "approved": False,
+    }
+    EMI_SUGGESTED_SOURCES.append(entry)
+    print(f"[EMI] Nouvelle suggestion de source reçue : {entry['name']} ({entry['url']})")
+    return {"status": "ok", "message": "Merci ! Votre suggestion sera revue avant publication."}
+
+@app.get("/emi/quiz")
+def emi_quiz():
+    return {"quiz": EMI_QUIZ}
+
 
 class Message(BaseModel):
     role:    str
@@ -534,18 +879,42 @@ def _initial_state(req: ChatRequest) -> AgentState:
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    loop  = asyncio.get_event_loop()
-    start = time.time()
-    final = await loop.run_in_executor(None, edubot_graph.invoke, _initial_state(req))
-    meta  = {
-        "topic":      final["topic"],
-        "model_used": final["model_used"],
-        "code_plan":  final.get("code_plan", []),
-        "language":   final.get("language", "fr"),
-        "elapsed_ms": int((time.time() - start) * 1000),
-    }
+    """
+    Streaming RÉEL, token par token, directement depuis Groq/Gemini.
+    Contrairement à /chat (qui passe par le graphe LangGraph complet avec
+    relecture qualité + retries — plus robuste mais pas streamable), cet
+    endpoint fait un seul appel direct au modèle pour pouvoir renvoyer les
+    tokens au fil de l'eau. Le sujet est tout de même classifié pour choisir
+    le bon system prompt spécialisé (tech, science, santé, etc.).
+    """
+    classification = classify_question(req.message)
+    lang = classification["language"]
+    topic = classification["topic"]
+
+    if topic == "coder":
+        # Génération de code : on garde le comportement non-streamé et
+        # structuré (plan + code complet), plus adapté à ce cas d'usage.
+        loop  = asyncio.get_event_loop()
+        start = time.time()
+        final = await loop.run_in_executor(None, edubot_graph.invoke, _initial_state(req))
+        async def _single_shot():
+            meta = {
+                "topic": final["topic"], "model_used": final["model_used"],
+                "code_plan": final.get("code_plan", []), "language": final.get("language", "fr"),
+                "elapsed_ms": int((time.time() - start) * 1000),
+            }
+            yield f"data: {json.dumps({'type': 'meta', **meta})}\n\n"
+            yield f"data: {json.dumps({'type': 'chunk', 'text': final['response']})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return StreamingResponse(_single_shot(), media_type="text/event-stream",
+                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    instruction, prefer_gemini = TOPIC_INSTRUCTIONS.get(topic, TOPIC_INSTRUCTIONS["general"])
+    sys_p = get_system_prompt(lang) + "\n\n" + instruction
+    messages = build_messages(sys_p, [{"role": h.role, "content": h.content} for h in (req.history or [])], req.message)
+
     return StreamingResponse(
-        stream_response(final["response"], meta),
+        real_stream(messages, max_tokens=2048, temperature=0.6, prefer_gemini=prefer_gemini),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -583,15 +952,16 @@ def list_models():
 def root():
     return {
         "status":    "EduBot en ligne",
-        "version":   "3.0.0",
+        "version":   "3.1.0",
         "author":    "Janvier NZAMBIMANA — M1 ITN",
         "topics":    ["tech","science","humanités","santé","général","code"],
+        "emi_endpoints": ["/emi/factcheck/stream","/emi/tips","/emi/sources","/emi/quiz"],
         "languages": ["français","anglais","swahili","kirundi"],
         "models":    len(GROQ_MODELS) + len(GEMINI_MODELS),
     }
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "timestamp": time.time(), "version": "3.0.0"}
+    return {"status": "ok", "timestamp": time.time(), "version": "3.1.0"}
 
 print(f"EduBot v3 prêt — {len(GROQ_MODELS) + len(GEMINI_MODELS)} modèles disponibles")
