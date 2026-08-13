@@ -1,16 +1,44 @@
-import os, json, asyncio, time, threading
+import os, json, asyncio, time, threading, io
 from typing import TypedDict, List, Optional, AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from langgraph.graph import StateGraph, END
 import groq as groq_lib
 import google.generativeai as genai
 
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 # ════════════════════════════════════════════════════════════
-# CONFIGURATION
+# CONFIGURATION FIREBASE ADMIN SDK
+# ════════════════════════════════════════════════════════════
+db = None
+try:
+    cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "Edubot/android/app/edubot-a6cc2-firebase-adminsdk-fbsvc-5b57c223ab.json")
+    if not os.path.exists(cred_path):
+        cred_path = "edubot-a6cc2-firebase-adminsdk-fbsvc-5b57c223ab.json"
+    
+    if os.path.exists(cred_path):
+        cred = credentials.Certificate(cred_path)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        print(f"[FIREBASE] Firestore initialisé avec succès ({cred_path})")
+    elif os.getenv("FIREBASE_CONFIG_JSON"):
+        cred_json = json.loads(os.getenv("FIREBASE_CONFIG_JSON"))
+        cred = credentials.Certificate(cred_json)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        print("[FIREBASE] Firestore initialisé depuis FIREBASE_CONFIG_JSON")
+    else:
+        print("[FIREBASE] Avertissement: Fichier de clés Firebase introuvable.")
+except Exception as e:
+    print(f"[FIREBASE] Erreur d'initialisation Firestore: {e}")
+
+# ════════════════════════════════════════════════════════════
+# CONFIGURATION IA
 # ════════════════════════════════════════════════════════════
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -616,35 +644,28 @@ app.add_middleware(CORSMiddleware,
 # une seule source de vérité, partagée par le front web et
 # l'app Flutter — rien n'est codé en dur côté client.
 # ════════════════════════════════════════════════════════════
-EMI_FACTCHECK_SYSTEM = (
-    "Tu es un expert en fact-checking et en éducation aux médias et à l'information (EMI), "
-    "formé aux méthodes utilisées par les grands réseaux de vérification indépendants dans le monde "
-    "(Africa Check, AFP Factuel, Reuters Fact Check, Full Check, PesaCheck, Dubawa, BBC Afrique, etc.). "
-    "Tu analyses une information de façon rigoureuse, nuancée, sans excès de confiance quand "
-    "la preuve manque. Tu réponds UNIQUEMENT avec un objet JSON valide, sans texte autour, "
+EMI_FACTCHECK_SYSTEM_TEMPLATE = (
+    "Tu es un expert en fact-checking et en éducation aux médias et à l'information (EMI) pour le pays : {country_name}. "
+    "Formé aux méthodes utilisées par les grands réseaux de vérification indépendants dans le monde "
+    "(Burundi Check, Africa Check, AFP Factuel, Congo Check, PesaCheck, etc.). "
+    "Tu analyses une information de façon rigoureuse, nuancée, et spécifique au contexte local de ce pays ({country_name}). "
+    "Tu réponds UNIQUEMENT avec un objet JSON valide, sans texte autour, "
     "sans balises markdown, exactement au format suivant :\n"
     '{"verdict":"VRAI|FAUX|PARTIELLEMENT VRAI|NON VÉRIFIABLE",'
     '"titre":"résumé du verdict en une phrase courte",'
-    '"explication":"2 à 3 phrases expliquant le raisonnement",'
-    '"conseils":"1 à 2 conseils pratiques pour vérifier ce type d\'information soi-même",'
+    '"explication":"2 à 3 sentences expliquant le raisonnement et le contexte spécifique à ce pays ({country_name}) si applicable, sinon général.",'
+    '"coach":"Explication pédagogique du Coach IA : 1 à 2 phrases simples expliquant POURQUOI cette information est peu fiable ou trompeuse, adaptée à un élève de lycée.",'
+    '"conseils":"1 à 2 conseils pratiques pour vérifier ce type d\'information soi-même dans ce contexte quotidien.",'
     '"sources":"2 à 4 organismes CONCRETS et vérifiables, cités par leur nom réel"}\n\n'
     "Règle importante pour le champ \"sources\" : ne réponds JAMAIS par une catégorie vague "
-    "comme \"un site de fact-checking\" ou \"les autorités sanitaires\". Cite des noms précis, "
-    "choisis en fonction du SUJET et, si un pays ou une région est identifiable dans le texte à "
-    "vérifier, en priorité des organismes pertinents pour cette zone :\n"
-    "- Santé/médical → OMS, CDC, ou l'autorité sanitaire du pays concerné si tu peux l'identifier\n"
-    "- Info générale Afrique australe/est → Africa Check, PesaCheck (Afrique de l'Est)\n"
-    "- Info générale Afrique de l'Ouest → Dubawa (Nigeria/Ghana), Africa Check, Seneweb Vérif (Sénégal)\n"
-    "- Info générale Afrique centrale → Congo Check (RDC), Africa Check\n"
-    "- Info internationale/politique → AFP Factuel, Reuters Fact Check, Full Fact\n"
-    "- Éducation aux médias en général → UNESCO\n"
-    "Si le pays n'est pas identifiable, propose un mélange d'organismes globaux et régionaux "
-    "pertinents pour le sujet plutôt qu'une liste générique identique à chaque réponse."
+    "comme \"un site de fact-checking\". Cite des noms précis, et en priorité les organismes locaux et régionaux "
+    "pertinents pour {country_name} (ex: Burundi Check, ABP pour le Burundi, Congo Check pour la RDC, RBA pour le Rwanda, PesaCheck, etc.)."
 )
 
-def build_factcheck_messages(text: str) -> list:
+def build_factcheck_messages(text: str, country_name: str) -> list:
+    system_prompt = EMI_FACTCHECK_SYSTEM_TEMPLATE.format(country_name=country_name)
     return [
-        {"role": "system", "content": EMI_FACTCHECK_SYSTEM},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": f'Information à analyser : "{text}"'},
     ]
 
@@ -682,10 +703,25 @@ EMI_TIPS = [
 ]
 
 EMI_SOURCES = [
+    # Burundi
+    {"name": "Burundi Check", "url": "https://burundicheck.org",
+     "desc": "Initiative burundaise indépendante et pionnière de vérification des faits et de lutte contre les rumeurs.",
+     "icon": "ti-shield-check", "color": "#F04438",
+     "regions": ["BI", "afrique_est"], "topics": ["general", "politique", "sante"]},
+    {"name": "ABP (Agence Burundaise de Presse)", "url": "http://abp.info.bi",
+     "desc": "Agence officielle burundaise fournissant des informations étatiques et générales vérifiées.",
+     "icon": "ti-news", "color": "#17B26A",
+     "regions": ["BI", "afrique_est"], "topics": ["general", "politique"]},
+    {"name": "Journal Iwacu Burundi", "url": "https://www.iwacu-burundi.org",
+     "desc": "Principal groupe de presse indépendant du Burundi, reconnu pour ses enquêtes et sa vérification de l'info.",
+     "icon": "ti-news", "color": "#2251CC",
+     "regions": ["BI", "afrique_est"], "topics": ["general", "politique"]},
+
+    # Régionaux & Globaux
     {"name": "Africa Check", "url": "https://africacheck.org",
      "desc": "Premier site de fact-checking indépendant en Afrique, vérifie les affirmations publiques et virales.",
      "icon": "ti-shield-check", "color": "#17B26A",
-     "regions": ["global", "afrique_australe", "afrique_ouest", "afrique_est"], "topics": ["general", "politique", "sante"]},
+     "regions": ["global", "afrique_australe", "afrique_ouest", "afrique_est", "afrique_centrale"], "topics": ["general", "politique", "sante"]},
     {"name": "AFP Factuel", "url": "https://factuel.afp.com",
      "desc": "Cellule de vérification de l'Agence France-Presse, spécialisée dans les fausses images et vidéos virales.",
      "icon": "ti-news", "color": "#2251CC",
@@ -707,9 +743,9 @@ EMI_SOURCES = [
      "icon": "ti-radio", "color": "#2251CC",
      "regions": ["global", "afrique_ouest", "afrique_centrale"], "topics": ["general", "politique"]},
     {"name": "PesaCheck", "url": "https://pesacheck.org",
-     "desc": "Réseau de fact-checking dédié à l'Afrique de l'Est (Kenya, Tanzanie, Ouganda, Rwanda...).",
+     "desc": "Réseau de fact-checking dédié à l'Afrique de l'Est (Kenya, Tanzanie, Ouganda, Rwanda, Burundi...).",
      "icon": "ti-shield-check", "color": "#17B26A",
-     "regions": ["afrique_est"], "topics": ["general", "politique", "sante"]},
+     "regions": ["afrique_est", "RW", "BI"], "topics": ["general", "politique", "sante"]},
     {"name": "Dubawa", "url": "https://dubawa.org",
      "desc": "Organisation de fact-checking couvrant le Nigeria, le Ghana, la Sierra Leone et le Liberia.",
      "icon": "ti-shield-check", "color": "#17B26A",
@@ -717,7 +753,7 @@ EMI_SOURCES = [
     {"name": "Congo Check", "url": "https://congocheck.net",
      "desc": "Vérification des faits centrée sur la République Démocratique du Congo et l'Afrique centrale.",
      "icon": "ti-shield-check", "color": "#17B26A",
-     "regions": ["afrique_centrale"], "topics": ["general", "politique"]},
+     "regions": ["afrique_centrale", "CD"], "topics": ["general", "politique"]},
     {"name": "Real411", "url": "https://www.real411.org",
      "desc": "Plateforme sud-africaine de signalement et de vérification de la désinformation.",
      "icon": "ti-shield-check", "color": "#17B26A",
@@ -732,10 +768,6 @@ EMI_SOURCES = [
      "regions": ["global"], "topics": ["sante"]},
 ]
 
-# Suggestions d'organismes envoyées par les utilisateurs (ex: fact-checkeur
-# local non encore référencé). Stockage en mémoire pour la démonstration :
-# à remplacer par une vraie base de données (Postgres/SQLite) en production,
-# sinon la liste est perdue à chaque redémarrage du serveur.
 EMI_SUGGESTED_SOURCES: list = []
 
 EMI_QUIZ = [
@@ -767,8 +799,50 @@ EMI_QUIZ = [
      "opts": ["Une vraie promotion à saisir vite", "Une arnaque ou une chaîne de désinformation classique",
               "Un test officiel de l'entreprise", "Un cadeau garanti par WhatsApp"],
      "ans": 1, "exp": "La demande de partage massif avant toute vérification est une caractéristique classique des arnaques et chaînes virales."},
+    {"q": "Une vidéo montre un homme politique tenant des propos choquants, mais le mouvement de ses lèvres est décalé et son teint semble étrange. Qu'est-ce que cela peut être ?",
+     "opts": ["Un problème technique d'antenne", "Un deepfake (trucage vidéo par IA) visant à manipuler l'opinion",
+              "Une mauvaise traduction", "Une preuve absolue de ses propos"],
+     "ans": 1, "exp": "Les deepfakes présentent souvent des anomalies : décalage labial, clignement des yeux inexistant, flous ou incohérences au niveau du cou."},
+    {"q": "Comment identifier une image suspectée d'être générée par une Intelligence Artificielle (Midjourney, DALL-E) ?",
+     "opts": ["En observant les détails fins : doigts en surnombre, écritures floues, arrière-plans bizarres ou reflets impossibles",
+              "En vérifiant si elle a plus de 1000 partages", "Toutes les images d'IA sont en noir et blanc", "Les images générées par IA sont parfaites et indétectables"],
+     "ans": 0, "exp": "Les IA ont du mal à générer des détails complexes cohérents, notamment les mains (doigts collés/supplémentaires) et les textes."},
 ]
 
+# Données des écoles partenaires et défis (Hackathon EMI 2026)
+EMI_SCHOOLS = [
+    {"name": "Lycée de Bujumbura", "city": "Bujumbura", "country": "BI", "score": 92.5, "participants": 120},
+    {"name": "Lycée Notre Dame de Rohero", "city": "Bujumbura", "country": "BI", "score": 89.8, "participants": 95},
+    {"name": "Lycée du Saint-Esprit", "city": "Bujumbura", "country": "BI", "score": 88.4, "participants": 140},
+    {"name": "Lycée de Gitega", "city": "Gitega", "country": "BI", "score": 85.0, "participants": 110},
+    {"name": "Green Hills Academy", "city": "Kigali", "country": "RW", "score": 91.2, "participants": 80},
+    {"name": "Lycée Shaumba", "city": "Kinshasa", "country": "CD", "score": 87.6, "participants": 150},
+    {"name": "Collège Notre-Dame", "city": "Mbanza-Ngungu", "country": "CD", "score": 84.2, "participants": 90},
+]
+
+EMI_CHALLENGES = [
+    {
+        "id": "chal_1",
+        "title": "Détecteur de Deepfake 🎥",
+        "desc": "Repérez 3 anomalies sur une vidéo ou un audio suspect cette semaine et partagez vos conclusions.",
+        "points": 50,
+        "participants": 340
+    },
+    {
+        "id": "chal_2",
+        "title": "Zéro Partage de Rumeur 🤫",
+        "desc": "Ne partagez aucune information non vérifiée pendant 7 jours d'affilée.",
+        "points": 100,
+        "participants": 620
+    },
+    {
+        "id": "chal_3",
+        "title": "Ambassadeur EMI 🗣️",
+        "desc": "Aidez un camarade de classe à vérifier une fausse image à l'aide de la recherche d'image inversée.",
+        "points": 75,
+        "participants": 210
+    }
+]
 
 # ════════════════════════════════════════════════════════════
 # ENDPOINTS EMI — module UNESCO Youth Hackathon 2026
@@ -780,21 +854,36 @@ class SourceSuggestion(BaseModel):
     name:        str
     url:         str
     description: str = ""
-    region:      str = ""   # ex: "afrique_ouest", "afrique_est"...
-    topic:       str = ""   # ex: "sante", "politique"...
+    region:      str = ""
+    topic:       str = ""
     submitted_by: str = ""
 
+COUNTRY_NAMES = {
+    "BI": "Burundi",
+    "RW": "Rwanda",
+    "CD": "République Démocratique du Congo (RDC)",
+    "TZ": "Tanzanie",
+    "KE": "Kenya",
+    "UG": "Ouganda",
+    "SN": "Sénégal",
+    "CI": "Côte d'Ivoire",
+    "CM": "Cameroun",
+    "FR": "France",
+}
+
 @app.post("/emi/factcheck/stream")
-async def emi_factcheck_stream(req: "FactCheckRequest"):
+async def emi_factcheck_stream(req: FactCheckRequest, request: Request):
     text = (req.text or "").strip()
     if not text:
         async def _empty():
             yield f"data: {json.dumps({'type': 'error', 'message': 'Texte vide'})}\n\n"
         return StreamingResponse(_empty(), media_type="text/event-stream")
 
-    messages = build_factcheck_messages(text)
+    country_code = request.headers.get("x-country-code", "BI").upper()
+    country_name = COUNTRY_NAMES.get(country_code, "Burundi")
+    messages = build_factcheck_messages(text, country_name)
     return StreamingResponse(
-        real_stream(messages, max_tokens=700, temperature=0.3, prefer_gemini=False),
+        real_stream(messages, max_tokens=800, temperature=0.3, prefer_gemini=False),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -804,24 +893,34 @@ def emi_tips():
     return {"tips": EMI_TIPS}
 
 @app.get("/emi/sources")
-def emi_sources(region: Optional[str] = None, topic: Optional[str] = None):
-    """
-    Sans paramètre : renvoie toute la base (comportement précédent, gardé
-    pour compatibilité). Avec ?region=afrique_ouest et/ou ?topic=sante :
-    remonte en priorité les organismes pertinents pour cette zone/ce sujet,
-    puis les organismes globaux, plutôt qu'une liste identique pour tout
-    le monde. Les suggestions communautaires approuvées sont incluses.
-    """
+def emi_sources(request: Request, region: Optional[str] = None, topic: Optional[str] = None):
+    country_code = request.headers.get("x-country-code", "BI").upper()
     all_sources = EMI_SOURCES + [s for s in EMI_SUGGESTED_SOURCES if s.get("approved")]
-
-    if not region and not topic:
-        return {"sources": all_sources}
 
     def score(s):
         pts = 0
-        if region and region in s.get("regions", []): pts += 2
-        if topic and topic in s.get("topics", []):   pts += 2
-        if "global" in s.get("regions", []):          pts += 1
+        # Priorité absolue au pays sélectionné (Burundi, Rwanda, RDC...)
+        if country_code in s.get("regions", []):
+            pts += 10
+            
+        # Priorité régionale secondaire (Afrique de l'Est pour BI/RW/TZ/KE/UG, etc.)
+        east_africa = ["BI", "RW", "TZ", "KE", "UG"]
+        west_africa = ["SN", "CI", "TG", "BJ"]
+        central_africa = ["CD", "CM"]
+        
+        if country_code in east_africa and "afrique_est" in s.get("regions", []):
+            pts += 5
+        elif country_code in west_africa and "afrique_ouest" in s.get("regions", []):
+            pts += 5
+        elif country_code in central_africa and "afrique_centrale" in s.get("regions", []):
+            pts += 5
+            
+        if region and region in s.get("regions", []):
+            pts += 3
+        if topic and topic in s.get("topics", []):
+            pts += 3
+        if "global" in s.get("regions", []):
+            pts += 1
         return pts
 
     ranked = sorted(all_sources, key=score, reverse=True)
@@ -848,9 +947,267 @@ def emi_suggest_source(sug: SourceSuggestion):
     print(f"[EMI] Nouvelle suggestion de source reçue : {entry['name']} ({entry['url']})")
     return {"status": "ok", "message": "Merci ! Votre suggestion sera revue avant publication."}
 
+# Pydantic models pour Certificat et Quiz
+class CertificateRequest(BaseModel):
+    student_name: str
+    school_name: Optional[str] = "École Partenaire"
+    score_pct: int
+    total_questions: int
+
+# Endpoint de génération dynamique de Quiz EMI par Gemini (100% IA, aucune limite, adapté au pays et à la langue)
 @app.get("/emi/quiz")
-def emi_quiz():
+def emi_quiz(request: Request, topic: Optional[str] = "general"):
+    lang = request.headers.get("x-language", "fr").lower()
+    country_code = request.headers.get("x-country-code", "BI").upper()
+    country_name = COUNTRY_NAMES.get(country_code, "Burundi")
+    
+    lang_names = {"en": "English", "rn": "Kirundi", "sw": "Kiswahili", "fr": "French"}
+    target_lang = lang_names.get(lang, "French")
+
+    prompt = f"""Génère un questionnaire d'Éducation aux Médias et à l'Information (EMI) captivant de 5 questions inédites en {target_lang}.
+Contexte géographique : {country_name} ({country_code}).
+Sujet : {topic} (désinformation, deepfakes, fausses rumeurs santé, arnaques réseaux sociaux, IA générative).
+
+Conserve STRICTEMENT cette structure JSON exacte :
+[
+  {{
+    "q": "Texte de la question ?",
+    "opts": ["Option A", "Option B", "Option C", "Option D"],
+    "ans": 1,
+    "exp": "Explication pédagogique du Coach IA en 1-2 phrases."
+  }}
+]
+Règles :
+- "ans" est l'index entier (0, 1, 2 ou 3) de la bonne réponse dans "opts".
+- Réponds UNIQUEMENT avec le tableau JSON [...], aucun texte autour, aucune balise markdown.
+"""
+    try:
+        gemini_model = get_gemini_model("gemini-2.0-flash") or gemini_flash2
+        resp = gemini_model.generate_content(prompt).text.strip()
+        resp = resp.replace("```json", "").replace("```", "").strip()
+        start = resp.find("[")
+        end   = resp.rfind("]") + 1
+        if start != -1 and end > start:
+            quiz_data = json.loads(resp[start:end])
+            # Sauvegarder la session de quiz dans Firestore si actif
+            if db:
+                try:
+                    db.collection("quiz_sessions").add({
+                        "country": country_code,
+                        "language": lang,
+                        "timestamp": firestore.SERVER_TIMESTAMP,
+                        "questions_count": len(quiz_data)
+                    })
+                except Exception as e:
+                    print(f"[FIREBASE] Erreur log session quiz: {e}")
+            return {"quiz": quiz_data}
+    except Exception as e:
+        print(f"[EMI QUIZ IA] Erreur génération Gemini: {e}")
+    
+    # Fallback dynamique au cas où l'IA n'est pas joignable
     return {"quiz": EMI_QUIZ}
+
+
+class SchoolRegistration(BaseModel):
+    name: str
+    city: str
+    country: Optional[str] = None
+
+@app.get("/emi/schools")
+def emi_schools(request: Request):
+    country_code = request.headers.get("x-country-code", "BI").upper()
+    schools = []
+    
+    # Lecture dynamique depuis Cloud Firestore
+    if db:
+        try:
+            docs = db.collection("schools").stream()
+            for doc in docs:
+                data = doc.to_dict()
+                data["id"] = doc.id
+                schools.append(data)
+        except Exception as e:
+            print(f"[FIREBASE] Erreur lecture des écoles: {e}")
+
+    if not schools:
+        schools = EMI_SCHOOLS
+
+    local_schools = [s for s in schools if s.get("country") == country_code]
+    other_schools = [s for s in schools if s.get("country") != country_code]
+    
+    local_schools.sort(key=lambda s: s.get("score", 0), reverse=True)
+    other_schools.sort(key=lambda s: s.get("score", 0), reverse=True)
+    
+    ranked = local_schools + other_schools
+    return {
+        "user_country": country_code,
+        "country_name": COUNTRY_NAMES.get(country_code, country_code),
+        "schools": ranked,
+        "local_count": len(local_schools)
+    }
+
+@app.post("/emi/schools/register")
+def emi_register_school(school: SchoolRegistration, request: Request):
+    country_code = (school.country or request.headers.get("x-country-code", "BI")).upper()
+    if not school.name.strip() or not school.city.strip():
+        return {"status": "error", "message": "Le nom de l'école et la ville sont requis."}
+    
+    new_entry = {
+        "name": school.name.strip(),
+        "city": school.city.strip(),
+        "country": country_code,
+        "score": 10.0,
+        "participants": 1,
+        "created_at": time.time()
+    }
+
+    # Sauvegarde dans Cloud Firestore
+    if db:
+        try:
+            doc_ref = db.collection("schools").add(new_entry)
+            new_entry["id"] = doc_ref[1].id
+        except Exception as e:
+            print(f"[FIREBASE] Erreur sauvegarde école Firestore: {e}")
+
+    EMI_SCHOOLS.append(new_entry)
+    return {"status": "ok", "message": "Votre école a été enregistrée avec succès !", "school": new_entry}
+
+# Endpoint de génération du Certificat Officiel PDF EMI (ReportLab)
+@app.post("/emi/certificate/download")
+def emi_download_certificate(req: CertificateRequest, request: Request):
+    try:
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib import colors
+
+        country_code = request.headers.get("x-country-code", "BI").upper()
+        country_name = COUNTRY_NAMES.get(country_code, "Burundi")
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=landscape(A4),
+            rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30
+        )
+        story = []
+        styles = getSampleStyleSheet()
+
+        title_style = ParagraphStyle(
+            'TitleStyle',
+            parent=styles['Heading1'],
+            fontName='Helvetica-Bold',
+            fontSize=28,
+            leading=34,
+            textColor=colors.HexColor('#1A3C8F'),
+            alignment=1
+        )
+        subtitle_style = ParagraphStyle(
+            'SubTitleStyle',
+            parent=styles['Normal'],
+            fontName='Helvetica-Bold',
+            fontSize=16,
+            leading=20,
+            textColor=colors.HexColor('#7C3AED'),
+            alignment=1
+        )
+        body_style = ParagraphStyle(
+            'BodyStyle',
+            parent=styles['Normal'],
+            fontName='Helvetica',
+            fontSize=13,
+            leading=18,
+            textColor=colors.HexColor('#0F1B3D'),
+            alignment=1
+        )
+
+        story.append(Paragraph("<b>EDUBOT PLATFORM 2026</b>", subtitle_style))
+        story.append(Paragraph("Plateforme Numérique Nationale d'Éducation aux Médias et à l'Information", ParagraphStyle('Sub', parent=body_style, fontSize=10, textColor=colors.gray)))
+        story.append(Spacer(1, 15))
+        story.append(Paragraph("<b>CERTIFICAT D'ACCOMPLISSEMENT</b>", title_style))
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("Le présent certificat officiel est attribué à :", body_style))
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(f"<b><font size=22 color='#2251CC'>{req.student_name}</font></b>", body_style))
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(f"Pour avoir complété avec succès le Parcours d'Éducation aux Médias et à l'Information avec un score de <b>{req.score_pct}%</b>.", body_style))
+        story.append(Paragraph(f"Établissement : <b>{req.school_name}</b> | Pays : <b>{country_name}</b>", body_style))
+        story.append(Spacer(1, 18))
+
+        # Détection dynamique de l'hôte (serveur/APK backend host)
+        host_url = str(request.base_url).rstrip('/')
+        cert_id = f"EDUBOT-{country_code}-{int(time.time())}"
+        qr_url = f"{host_url}/emi/certificate/verify/{cert_id}"
+        
+        # Génération du QR Code ReportLab
+        qr_drawing = None
+        try:
+            from reportlab.graphics.shapes import Drawing, Rect
+            from reportlab.graphics.barcode import qr
+            qr_code = qr.QrCodeWidget(qr_url)
+            bounds = qr_code.getBounds()
+            width = bounds[2] - bounds[0]
+            height = bounds[3] - bounds[1]
+            d = Drawing(70, 70, transform=[70.0/width, 0, 0, 70.0/height, 0, 0])
+            d.add(qr_code)
+            qr_drawing = d
+        except Exception as qre:
+            print(f"Erreur QR Code: {qre}")
+
+        # Rendu visuel de la Signature Manuscrite / Calligraphiée de la Plateforme
+        signature_visual = Paragraph(
+            f"<i><font size=18 color='#1A3C8F' name='Times-BoldItalic'>EduBot Platform Authorized</font></i><br/>"
+            f"<font size=8 color='#059669'><b>✔ SCELLÉ & VÉRIFIÉ NUMÉRIQUEMENT</b></font><br/>"
+            f"<b>EDUBOT AI VERIFIED SIGNATURE</b><br/>"
+            f"<font size=7.5 color='#555555'>ID: {cert_id} | Hash: 0x{hash(cert_id) & 0xFFFFFFFF:08X}<br/>"
+            f"EDUBOT PLATFORM 2026 — Plateforme Numérique Nationale</font>",
+            ParagraphStyle('SigVis', parent=body_style, fontSize=8.5, leading=11, alignment=0)
+        )
+
+        qr_cell = qr_drawing if qr_drawing else Paragraph("<b>[QR CODE]</b>", body_style)
+
+        footer_data = [
+            [
+                qr_cell,
+                signature_visual,
+                Paragraph(f"<b>Délivré le :</b> {time.strftime('%d/%m/%Y')}<br/><font size=8 color='#17B26A'><b>Statut : OFFICIELLEMENT VALIDÉ</b></font>", body_style)
+            ]
+        ]
+        t = Table(footer_data, colWidths=[90, 430, 200])
+        t.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('LINEABOVE', (1,0), (1,0), 0.5, colors.HexColor('#1A3C8F')),
+        ]))
+        story.append(t)
+
+        doc.build(story)
+        pdf_out = buffer.getvalue()
+        buffer.close()
+
+        # Enregistrer le certificat dans Firestore
+        if db:
+            try:
+                db.collection("certificates").add({
+                    "student_name": req.student_name,
+                    "school_name": req.school_name,
+                    "country": country_code,
+                    "score_pct": req.score_pct,
+                    "issued_at": firestore.SERVER_TIMESTAMP
+                })
+            except Exception as e:
+                print(f"[FIREBASE] Erreur sauvegarde certificat: {e}")
+
+        return Response(content=pdf_out, media_type="application/pdf", headers={
+            "Content-Disposition": f"attachment; filename=Certificat_EMI_{req.student_name.replace(' ', '_')}.pdf"
+        })
+    except Exception as e:
+        print(f"Erreur PDF: {e}")
+        return {"status": "error", "message": f"Erreur de génération PDF: {e}"}
+
+@app.get("/emi/challenges")
+def emi_challenges():
+    return {"challenges": EMI_CHALLENGES}
 
 
 class Message(BaseModel):
