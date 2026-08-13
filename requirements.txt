@@ -8,6 +8,7 @@ uvicorn[standard]==0.32.1
 
 # Validation des donnees
 pydantic==2.10.3
+pydantic-core==2.27.1
 
 # Orchestration des agents IA
 langgraph==0.2.60
@@ -18,6 +19,12 @@ groq==0.13.1
 
 # Modeles IA - Google Gemini (Flash, Pro, 2.0)
 google-generativeai==0.8.3
+
+# Stockage et base de donnees Cloud Firestore
+firebase-admin==6.6.0
+
+# Generation de Certificats PDF
+reportlab==4.2.5
 
 # Variables d'environnement
 python-dotenv==1.0.1
