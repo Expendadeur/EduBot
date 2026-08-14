@@ -1001,9 +1001,6 @@ Règles :
                 except Exception as e:
                     print(f"[FIREBASE] Erreur log session quiz: {e}")
             return {"quiz": quiz_data}
-    except Exception as e:
-        print(f"[EMI QUIZ IA] Erreur génération Gemini: {e}")
-    
     # Fallback dynamique au cas où l'IA n'est pas joignable
     return {"quiz": EMI_QUIZ}
 
