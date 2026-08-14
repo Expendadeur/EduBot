@@ -321,17 +321,11 @@ def build_messages(system: str, history: list, question: str) -> list:
 AUTHOR_SIGNATURE = """
 
 ---
-*Réponse générée par EduBot — Assistant Pédagogique Intelligent*
-*Janvier NZAMBIMANA | Étudiant M1 ITN*
-*Support / signaler une erreur : janviernzambimana91@gmail.com*
-
-*EduBot est gratuit pour tous les étudiants. Si utile, soutenez via :*
-*Mobile Money / Lumicash : +257 68 58 97 29 (Janvier NZAMBIMANA)*
-
+*Réponse générée par EduBot — Assistant Pédagogique Intelligent & Module EMI*
 > **Important** : Vérifiez toujours les informations importantes avant de les utiliser."""
 
-BASE_PROMPT = """Tu es EduBot, assistant pédagogique professionnel créé par Janvier NZAMBIMANA (M1 ITN).
-Tu aides les étudiants africains et mondiaux dans leurs apprentissages.
+BASE_PROMPT = """Tu es EduBot, assistant pédagogique professionnel et expert en éducation aux médias et à l'information (EMI).
+Tu aides les étudiants et les citoyens dans leurs apprentissages et la vérification d'informations.
 Réponds en français sauf si l'utilisateur écrit dans une autre langue.
 Sois clair, pédagogique, bienveillant, précis.
 Structure tes réponses avec des titres quand utile.
@@ -982,25 +976,29 @@ Règles :
 - Réponds UNIQUEMENT avec le tableau JSON [...], aucun texte autour, aucune balise markdown.
 """
     try:
-        gemini_model = get_gemini_model("gemini-2.0-flash") or gemini_flash2
-        resp = gemini_model.generate_content(prompt).text.strip()
-        resp = resp.replace("```json", "").replace("```", "").strip()
-        start = resp.find("[")
-        end   = resp.rfind("]") + 1
-        if start != -1 and end > start:
-            quiz_data = json.loads(resp[start:end])
-            # Sauvegarder la session de quiz dans Firestore si actif
-            if db:
-                try:
-                    db.collection("quiz_sessions").add({
-                        "country": country_code,
-                        "language": lang,
-                        "timestamp": firestore.SERVER_TIMESTAMP,
-                        "questions_count": len(quiz_data)
-                    })
-                except Exception as e:
-                    print(f"[FIREBASE] Erreur log session quiz: {e}")
-            return {"quiz": quiz_data}
+        gemini_model = get_gemini_model("gemini-2.0-flash")
+        if gemini_model:
+            resp = gemini_model.generate_content(prompt).text.strip()
+            resp = resp.replace("```json", "").replace("```", "").strip()
+            start = resp.find("[")
+            end   = resp.rfind("]") + 1
+            if start != -1 and end > start:
+                quiz_data = json.loads(resp[start:end])
+                # Sauvegarder la session de quiz dans Firestore si actif
+                if db:
+                    try:
+                        db.collection("quiz_sessions").add({
+                            "country": country_code,
+                            "language": lang,
+                            "timestamp": firestore.SERVER_TIMESTAMP,
+                            "questions_count": len(quiz_data)
+                        })
+                    except Exception as e:
+                        print(f"[FIREBASE] Erreur log session quiz: {e}")
+                return {"quiz": quiz_data}
+    except Exception as e:
+        print(f"[EMI QUIZ IA] Erreur génération Gemini: {e}")
+
     # Fallback dynamique au cas où l'IA n'est pas joignable
     return {"quiz": EMI_QUIZ}
 
