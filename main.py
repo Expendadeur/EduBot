@@ -882,6 +882,71 @@ async def emi_factcheck_stream(req: FactCheckRequest, request: Request):
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
+class ImageAnalysisRequest(BaseModel):
+    image_base64: str
+    prompt: Optional[str] = None
+
+@app.post("/emi/analyze-image")
+async def emi_analyze_image(req: ImageAnalysisRequest, request: Request):
+    if not req.image_base64:
+        return {"status": "error", "message": "Aucune image fournie."}
+
+    raw_b64 = req.image_base64
+    mime_type = "image/jpeg"
+    if "," in raw_b64:
+        header, raw_b64 = raw_b64.split(",", 1)
+        if "png" in header.lower():
+            mime_type = "image/png"
+        elif "webp" in header.lower():
+            mime_type = "image/webp"
+
+    try:
+        import base64
+        image_bytes = base64.b64decode(raw_b64)
+    except Exception as e:
+        return {"status": "error", "message": f"Format Base64 invalide : {e}"}
+
+    country_code = request.headers.get("x-country-code", "BI").upper()
+    country_name = COUNTRY_NAMES.get(country_code, "Burundi")
+
+    user_prompt = req.prompt or "Analyse cette image pour vérifier son authenticité, détecter si elle a été générée par IA ou modifiée (Deepfake), et fournir des conseils de vérification."
+
+    sys_instruction = f"""Tu es le Coach Fact-Checking & EMI d'EduBot pour {country_name}.
+Analyse visuellement cette image et fournis une évaluation experte et pédagogique.
+
+Structure ta réponse clairement avec du markdown :
+1. 🔍 **Résultat de l'analyse visuelle** (métadonnées supposées, incohérences de texture/lumière/mains/texte, artefacts d'IA).
+2. 🤖 **Probabilité d'IA / Deepfake** (Donne une estimation en %, ex: 85% d'être générée par Midjourney/DALL-E/Flux, ou 'Image probablement authentique').
+3. ⚠️ **Points d'attention & anomalies** (Si applicables).
+4. 💡 **Conseils pratiques de vérification** (Recherche d'image inversée Google/TinEye, croisement des sources).
+
+Sois concis, pédagogique et structuré avec des puces.
+"""
+
+    gemini_model = get_gemini_model("gemini-2.0-flash")
+    if not gemini_model:
+        return {"status": "error", "message": "Modèle Gemini Vision non disponible actuellement."}
+
+    try:
+        image_part = {
+            "mime_type": mime_type,
+            "data": image_bytes
+        }
+        contents = [sys_instruction + "\n\nDemande utilisateur : " + user_prompt, image_part]
+        response = gemini_model.generate_content(contents)
+        result_text = response.text.strip() if response and response.text else "Analyse terminée."
+
+        return {
+            "status": "ok",
+            "analysis": result_text,
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        print(f"[EMI IMAGE VISION] Erreur d'analyse: {e}")
+        err_msg = user_friendly_error(str(e))
+        return {"status": "error", "message": f"Impossible d'analyser l'image : {err_msg}"}
+
+
 @app.get("/emi/tips")
 def emi_tips():
     return {"tips": EMI_TIPS}
