@@ -865,6 +865,32 @@ COUNTRY_NAMES = {
     "FR": "France",
 }
 
+def build_messages(sys_prompt: str, history: list, user_message: str) -> list:
+    msgs = [{"role": "system", "content": sys_prompt}]
+    for h in history:
+        r = "user" if h.get("role") in ["user", "human"] else "assistant"
+        msgs.append({"role": r, "content": h.get("content", "")})
+    msgs.append({"role": "user", "content": user_message})
+    return msgs
+
+def build_factcheck_messages(text: str, country_name: str) -> list:
+    sys_prompt = f"""Tu es le Coach Fact-Checking & Éducation aux Médias et à l'Information (EMI) d'EduBot pour {country_name}.
+Ton rôle est d'analyser l'information, la rumeur ou la déclaration soumise par l'utilisateur avec rigueur et méthode.
+
+Structure TOUJOURS ta réponse ainsi :
+1. 🎯 **Évaluation globale** (VRAI, FAUX, EN PARTIE VRAI, NON VÉRIFIABLE / DÉCOUPÉ DU CONTEXTE).
+2. 🔍 **Analyse & Explication** (Détaille les faits, identifie les éléments suspects, l'origine probable et les biais).
+3. ⚠️ **Pièges & Signaux d'alerte** (Pourquoi cette info peut induire en erreur).
+4. 💡 **Conseils du Coach EMI** (Comment vérifier soi-même cette information, quelles sources officielles consulter à {country_name}).
+
+Sois clair, factuel, pédagogue et concis.
+"""
+    return [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": f"Vérifie cette information / déclaration :\n\"{text}\""}
+    ]
+
+
 @app.post("/emi/factcheck/stream")
 async def emi_factcheck_stream(req: FactCheckRequest, request: Request):
     text = (req.text or "").strip()
@@ -947,9 +973,115 @@ Sois concis, pédagogique et structuré avec des puces.
         return {"status": "error", "message": f"Impossible d'analyser l'image : {err_msg}"}
 
 
+class ScamDetectionRequest(BaseModel):
+    text: str
+
+@app.post("/emi/detect-scam")
+async def emi_detect_scam(req: ScamDetectionRequest, request: Request):
+    """
+    Détecteur d'arnaques spécialisé : fausses bourses, faux emplois, fraudes Mobile Money.
+    Retourne un rapport structuré avec un booléen is_scam et des explications pédagogiques.
+    """
+    text = (req.text or "").strip()
+    if not text:
+        return {"status": "error", "message": "Texte vide."}
+
+    country_code = request.headers.get("x-country-code", "BI").upper()
+    country_name = COUNTRY_NAMES.get(country_code, "Burundi")
+
+    scam_prompt = f"""Tu es un expert anti-escroquerie numérique pour {country_name}, spécialisé dans la détection des arnaques qui ciblent les jeunes et les étudiants en Afrique subsaharienne.
+
+Analyse ce message pour détecter s'il s'agit d'une arnaque (fausse bourse, faux emploi, fraude Mobile Money, phishing, escroquerie aux frais de dossier, etc.).
+
+SIGNAUX D'ARNAQUE COURANTS à rechercher :
+- Demande de paiement Mobile Money (Lumicash, EcoCash, M-Pesa, Orange Money, Airtel Money, MTN MoMo)
+- Email non officiel (@gmail.com, @yahoo.com au lieu de @universite.edu, @gouv.bi, @un.org, @unesco.org)
+- Urgence extrême ("Offre limitée", "Répondez dans 24h", "Places limitées")
+- Promesses irréalistes (salaires en USD/EUR très élevés sans prérequis, bourses sans concours)
+- Fautes d'orthographe ou de grammaire dans un document soi-disant officiel
+- Demande d'informations personnelles sensibles (numéro CNI, mot de passe, code OTP)
+- Absence d'adresse physique, de numéro de téléphone fixe ou de site web officiel
+
+Réponds UNIQUEMENT avec ce JSON (pas de texte autour) :
+{{
+  "is_scam": true ou false,
+  "verdict": "ARNAQUE CONFIRMÉE" ou "PROBABLEMENT ARNAQUE" ou "SUSPECT" ou "LÉGITIME",
+  "niveau_risque": "ÉLEVÉ" ou "MOYEN" ou "FAIBLE",
+  "signaux_detectes": ["signal 1", "signal 2"],
+  "explication": "Explication claire en 2-3 phrases de pourquoi c'est ou n'est pas une arnaque.",
+  "conseils": "2-3 conseils concrets pour se protéger ou vérifier l'authenticité."
+}}
+
+Message à analyser :
+"{text}"
+"""
+    try:
+        gemini_model = get_gemini_model("gemini-2.0-flash")
+        if gemini_model:
+            resp = gemini_model.generate_content(scam_prompt).text.strip()
+            resp = resp.replace("```json", "").replace("```", "").strip()
+            s = resp.find("{")
+            e = resp.rfind("}") + 1
+            if s != -1 and e > s:
+                data = json.loads(resp[s:e])
+                is_scam = data.get("is_scam", False)
+                verdict = data.get("verdict", "INCONNU")
+                niveau = data.get("niveau_risque", "INCONNU")
+                signaux = data.get("signaux_detectes", [])
+                explication = data.get("explication", "")
+                conseils = data.get("conseils", "")
+
+                # Construction du rapport Markdown structuré
+                signaux_md = "\n".join([f"- {s}" for s in signaux]) if signaux else "- Aucun signal détecté"
+                emoji = "🔴" if is_scam else "🟢"
+                analysis_md = f"""## {emoji} Verdict : **{verdict}**
+**Niveau de risque : {niveau}**
+
+### 🚨 Signaux détectés
+{signaux_md}
+
+### 📋 Explication
+{explication}
+
+### 💡 Conseils de protection
+{conseils}
+"""
+                return {
+                    "status": "ok",
+                    "is_scam": is_scam,
+                    "verdict": verdict,
+                    "analysis": analysis_md,
+                    "timestamp": time.time()
+                }
+    except Exception as e:
+        print(f"[EMI SCAM] Erreur Gemini: {e}")
+
+    # Fallback Groq si Gemini indisponible
+    try:
+        messages = [
+            {"role": "system", "content": f"Tu es un expert anti-escroquerie pour {country_name}. Analyse le message et détermine s'il s'agit d'une arnaque (fausse bourse, faux emploi, Mobile Money fraud). Réponds de façon structurée et pédagogique."},
+            {"role": "user", "content": f"Message suspect : \"{text}\"\n\nDétecte les signaux d'arnaque et explique si c'est dangereux."}
+        ]
+        result_text, _ = call_any_model(messages, max_tokens=600, temperature=0.2)
+        if result_text:
+            is_scam_keywords = ["arnaque", "frauduleux", "suspect", "attention", "méfiance", "dangereux", "faux", "escroquerie"]
+            is_scam = any(k in result_text.lower() for k in is_scam_keywords)
+            return {
+                "status": "ok",
+                "is_scam": is_scam,
+                "verdict": "ANALYSE GROQ",
+                "analysis": result_text,
+                "timestamp": time.time()
+            }
+    except Exception as e2:
+        print(f"[EMI SCAM] Erreur Groq fallback: {e2}")
+
+    return {"status": "error", "message": user_friendly_error("service error")}
+
 @app.get("/emi/tips")
 def emi_tips():
     return {"tips": EMI_TIPS}
+
 
 @app.get("/emi/sources")
 def emi_sources(request: Request, region: Optional[str] = None, topic: Optional[str] = None):
